@@ -22,3 +22,6 @@ venv/
 data/
 outputs/
 archive/
+src/__init__.py
+src/utils/__init__.py
+src/weakloc/__init__.py
