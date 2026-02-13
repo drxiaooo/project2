@@ -1,284 +1,209 @@
 
-本仓库用于在 **BS-80K 数据集**上完成 2D 全身骨显像（wholeBody ANT/POST）的两阶段流程：
+本项目面向**全身骨显像（bone scintigraphy）**中的疑似病灶定位与分割，采用“**弱监督定位（CAM/heatmap → bbox）→ 基于 bbox 的分割模型推理（SAM 系列/医学适配模型）→ 质量控制（QC）→ 汇总对比**”的工程化流程，最终将 **MedSAM (ViT-B)** 作为后续实验的主分割模型。
 
-1) **弱分类（normal/abnormal）**：输出异常概率 `y_prob` + 自动阈值选择  
-2) **弱定位（Grad-CAM）**：输出 heatmap  
-3) **伪框（pseudo boxes）**：从 heatmap 峰值生成固定大小小框（用于后续分割/大模型 prompt）  
-4) （进行中）**伪 mask**：计划用 MedSAM2 等分割大模型把伪框转为伪 mask，再训练专用分割网络
-
-> 当前主线视角：**POST**  
-> 关键预处理：**letterbox 保比例到 1024×512**（避免 resize 拉伸导致定位失真）
+> 课题目标（文档主线）：围绕“骨显像病灶精确分割 →（后续）良恶性判别 →（后续）全身负荷/分布评估”，构建可复现、可审查的 baseline 工程与结果证据包；并按周输出周报、持续 commit。
 
 ---
 
-## 1. 环境
-
-- Python: **3.10.19**
-- PyTorch: **2.10.0+cu128**
-- GPU: **NVIDIA RTX 5070 12GB**（推理/弱定位时 batch 需要控制）
-- 运行方式建议统一使用：`python -m src.xxx`（避免 `No module named 'src'`）
-
-缓存位置（可选参考）：
-- HuggingFace: `C:\Users\<USER>\.cache\huggingface\hub`
-- Torch Hub: `C:\Users\<USER>\.cache\torch\hub`
-
----
-
-## 2. 数据说明（BS-80K）
-
-数据集文件夹约定（来自 BS-80K 说明）：
-- 文件夹名结构：`part + L/R(optional) + view`，例如 `kneeLANT`
-- 每个文件夹包含同名 `.txt`：每行记录 `image_filename label`，`0=normal`，`1=abnormal`
-- whole body 文件夹：`wholeBodyANT`、`wholeBodyPOST`
-  - 其下额外包含 `ant/`、`post/` 子文件夹，内部 `.xml` 提供检测框信息（若存在）
-
-你本地示例：
-- wholeBody 图片路径：`E:\project\project2\data\wholeBodyANT` / `...wholeBodyPOST`
-- xml 示例：`E:\project\project2\data\wholeBodyANT\ant\1.xml`
-
----
-
-## 3. 项目结构
+## 1. 项目结构（建议理解路径）
 
 ```
 
 project2/
 src/
-**init**.py
-bs80k/
-parse_index.py
-split_wholebody.py
-cls/
-train_wholebody_cls.py
-select_threshold.py
-infer_split.py
-make_leaderboard.py
-weakloc/
-make_cam_test.py
-heatmap_to_bbox_test.py
-visualize_boxes_test.py
-export_boxes_to_orig_and_draw.py
-utils/
-letterbox.py
+weakloc/                    # 弱监督定位：CAM/heatmap 生成与 bbox 提取
+seg/                        # 分割：SAM2 / MedSAM2 / MedSAM / SAM-Med2D 推理 + QC + 汇总
+sam2/                         # SAM2 相关代码与依赖（推理脚本入口在 src/seg）
+third_party/
+SAM-Med2D/                  # 第三方：SAM-Med2D 源码（不一定是 pip 包形式）
 outputs/
-bs80k_index.csv
-splits/
-train.csv val.csv test.csv
-cls/
-<exp_dir>/
-best.pt
-preds_test.csv
-selected_threshold.json
-...
-weakloc_letterbox/
-test_cam/
-test_cam_npy/
-pseudo_boxes_test.csv
-letterbox_meta_test.csv
-test_boxes_vis/
-pseudo_boxes_test_orig.csv
-test_boxes_vis_orig/
+cls/                        # 分类模型实验输出（弱监督定位所依赖的 preds_test.csv）
+weakloc_fulltest/           # ✅ 全量 CAM/heatmap + bbox 输出（本周新增）
+seg_compare/
+sam2_full/                # ✅ SAM2 full 推理输出
+medsam2_full/             # ✅ MedSAM2 full 推理输出（tiny）
+medsam_full/              # ✅ MedSAM full 推理输出（ViT-B，最终选用）
+sam_med2d_full/           # ✅ SAM-Med2D full 推理输出（ViT-B）
+_summary_full/            # ✅ 汇总目录（summary.csv / merged_stats.csv / 直方图 / 拼图等）
+_archive/
+2026-02-12_subset120_box48_crop320_topk1_tighten8/   # ✅ 子集实验归档（防止污染）
 
 ````
 
 ---
 
-## 4. 从零开始复现（推荐命令）
+## 2. 数据与预处理约定
 
-### Step 1：生成索引与划分（wholeBody）
-```powershell
-python -m src.bs80k.parse_index
-python -m src.bs80k.split_wholebody
-````
-
-输出：
-
-* `outputs/bs80k_index.csv`（全量索引）
-* `outputs/splits/train.csv` / `val.csv` / `test.csv`（wholeBody 划分）
-
-> 参考运行结果：index 约 82545 行；wholeBody 划分：train=5194 / val=648 / test=652
+- 输入图像：全身骨显像 JPG（示例路径：`data/wholeBodyPOST/*.jpg`）
+- 统一推理几何策略（本周全量一致）：
+  - `--use_letterbox --out_w 1024 --out_h 512`：统一到 1024×512 的画布（保持纵横比+padding）
+  - `--use_crop --crop_size 320`：围绕 bbox 做局部裁剪推理
+  - `--topk 1`：每张图只取 top1 bbox（简化管线，便于稳定对比）
+  - `--tighten --margin 8`：对 bbox 收紧/扩边，避免过松引入噪声或过紧截断目标
 
 ---
 
-### Step 2：训练弱分类（ResNet-RS50 + POST + letterbox 1024×512）
+## 3. 环境（Conda）
 
-```powershell
-python -m src.cls.train_wholebody_cls `
-  --model "hf_hub:timm/resnetrs50.tf_in1k" `
-  --view POST `
-  --img_h 512 --img_w 1024 `
-  --bs 16 --epochs 20 --lr 1e-4 `
-  --amp `
-  --outdir resnetrs50_POST_letterbox
-```
+本项目采用两个环境（按你这周的实践）：
 
-输出目录：
+- `boneai`：弱监督定位、QC、汇总对比（pandas/绘图/统计等）
+- `seg_sam2`：分割推理（SAM2/MedSAM2/SAM-Med2D/MedSAM 推理依赖）
 
-* `outputs/cls/resnetrs50_POST_letterbox/`
+建议你在仓库后续补充：
+- `environment_boneai.yml`
+- `environment_seg_sam2.yml`
+以满足“可复现/可复查”的要求。
 
 ---
 
-### Step 3：自动选择阈值（val 上 Youden + sens_min）
+## 4. 本周已跑通的全量流程（341 → 275 的说明见 4.3）
 
+> 下面命令均在 `E:\project\project2` 路径示例；Linux/Mac 同理改路径。
+
+### 4.1 弱监督定位：生成 CAM/heatmap（全量）
 ```powershell
-python -m src.cls.select_threshold `
-  --exp_dir outputs/cls/resnetrs50_POST_letterbox `
-  --mode youden `
-  --save
-```
+conda activate boneai
+cd E:\project\project2
 
-输出：
-
-* `outputs/cls/resnetrs50_POST_letterbox/selected_threshold.json`
-
-示例（一次实验结果）：
-
-* best_epoch=9
-* thr=0.361
-* val：sens≈0.874 spec≈0.827 f1≈0.772
-
----
-
-### Step 4：在 test 集推理评估（使用 thr_from）
-
-```powershell
-python -m src.cls.infer_split `
-  --split_csv outputs/splits/test.csv `
-  --exp_dir outputs/cls/resnetrs50_POST_letterbox `
-  --model_name resnetrs50 `
-  --view POST `
-  --img_h 512 --img_w 1024 `
-  --bs 4 `
-  --amp `
-  --thr_from outputs/cls/resnetrs50_POST_letterbox
-```
-
-输出：
-
-* `outputs/cls/resnetrs50_POST_letterbox/preds_test.csv`
-
-示例（一次实验结果）：
-
-* AUC=0.8827
-* Acc=0.7830
-* Sens=0.8208
-* Spec=0.7660
-* TP=87 TN=180 FP=55 FN=19 (n=341)
-
----
-
-## 5. 弱定位与伪框（CAM → boxes）
-
-### Step 5：生成 CAM（仅对 y_prob >= thr 的样本）
-
-```powershell
 python -m src.weakloc.make_cam_test `
   --exp_dir outputs/cls/resnetrs50_POST_letterbox `
-  --out_root outputs/weakloc_letterbox `
-  --amp `
-  --max_imgs 999999
-```
+  --pred_csv outputs/cls/resnetrs50_POST_letterbox/preds_test.csv `
+  --out_root outputs/weakloc_fulltest `
+  --min_prob 0 `
+  --amp --max_imgs 999999
+````
 
 输出：
 
-* `outputs/weakloc_letterbox/test_cam/`（叠加图）
-* `outputs/weakloc_letterbox/test_cam_npy/`（heatmap npy）
-* `outputs/weakloc_letterbox/letterbox_meta_test.csv`（反变换元信息：scale/pad 等）
+* `outputs/weakloc_fulltest/test_cam/`（可视化叠加图）
+* `outputs/weakloc_fulltest/test_cam_npy/`（heatmap npy）
+* `outputs/weakloc_fulltest/letterbox_meta_test.csv`
 
-> 说明：heatmap 坐标系为 **letterbox 画布 1024×512**。
-
----
-
-### Step 6：从 heatmap 生成伪框（peak-fixed-box + NMS）
-
-推荐参数（当前使用 48×48 小框）：
+### 4.2 heatmap → bbox（全量）
 
 ```powershell
 python -m src.weakloc.heatmap_to_bbox_test `
   --exp_dir outputs/cls/resnetrs50_POST_letterbox `
-  --out_root outputs/weakloc_letterbox `
-  --max_boxes 5 `
-  --box_w 48 --box_h 48 `
-  --nms_iou 0.15
+  --out_root outputs/weakloc_fulltest `
+  --max_boxes 5 --box_w 48 --box_h 48 --nms_iou 0.15
 ```
 
 输出：
 
-* `outputs/weakloc_letterbox/pseudo_boxes_test.csv`
+* `outputs/weakloc_fulltest/pseudo_boxes_test.csv`
 
----
 
-### Step 7：伪框可视化（画在 1024×512 画布上）
+## 5. 分割推理（四模型对比）与最终选择
+
+### 5.1 SAM2（full）
 
 ```powershell
-python -m src.weakloc.visualize_boxes_test `
-  --out_root outputs/weakloc_letterbox `
-  --max_imgs 80
+conda activate seg_sam2
+cd E:\project\project2\sam2
+$env:PYTHONPATH="E:\project\project2;E:\project\project2\sam2"
+
+python -m src.seg.sam2_infer_boxes `
+  --out_root E:\project\project2\outputs\seg_compare\sam2_full `
+  --boxes_csv E:\project\project2\outputs\weakloc_fulltest\pseudo_boxes_test.csv `
+  --use_letterbox --out_w 1024 --out_h 512 `
+  --use_crop --crop_size 320 `
+  --topk 1 --max_imgs 999999 `
+  --tighten --margin 8 `
+  --save_vis_canvas
 ```
 
-输出：
-
-* `outputs/weakloc_letterbox/test_boxes_vis/`
-
----
-
-### Step 8：导出原图坐标框 + 原图叠框可视化（可选）
+### 5.2 MedSAM2（full，当前使用 tiny）
 
 ```powershell
-python -m src.weakloc.export_boxes_to_orig_and_draw `
-  --out_root outputs/weakloc_letterbox `
-  --max_imgs 120
+conda activate seg_sam2
+cd E:\project\project2\sam2
+$env:PYTHONPATH="E:\project\project2;E:\project\project2\sam2"
+
+python -m src.seg.medsam2_infer_boxes `
+  --out_root E:\project\project2\outputs\seg_compare\medsam2_full `
+  --use_letterbox --out_w 1024 --out_h 512 `
+  --use_crop --crop_size 320 `
+  --topk 1 --max_imgs 999999 `
+  --tighten --margin 8 `
+  --save_vis_canvas
 ```
 
-输出：
+### 5.3 MedSAM（full，ViT-B，✅后续主力）
 
-* `outputs/weakloc_letterbox/pseudo_boxes_test_orig.csv`
-* `outputs/weakloc_letterbox/test_boxes_vis_orig/`
+```powershell
+conda activate seg_sam2
+cd E:\project\project2\sam2
+$env:PYTHONPATH="E:\project\project2;E:\project\project2\sam2"
 
-> 该步骤使用 `letterbox_meta_test.csv` 做坐标反变换，保证框在原图位置正确。
+python -m src.seg.medsam_infer_boxes `
+  --out_root E:\project\project2\outputs\seg_compare\medsam_full `
+  --boxes_csv E:\project\project2\outputs\weakloc_fulltest\pseudo_boxes_test.csv `
+  --ckpt E:\project\project2\checkpoints\medsam\medsam_vit_b.pth `
+  --use_letterbox --out_w 1024 --out_h 512 `
+  --use_crop --crop_size 320 `
+  --topk 1 --max_imgs 999999 `
+  --tighten --margin 8 `
+  --save_vis_canvas
+```
+
+### 5.4 SAM-Med2D（full，ViT-B）
+
+```powershell
+conda activate seg_sam2
+cd E:\project\project2
+$env:PYTHONPATH="E:\project\project2;E:\project\project2\third_party\SAM-Med2D"
+
+python -m src.seg.sam_med2d_infer_boxes `
+  --out_root outputs\seg_compare\sam_med2d_full `
+  --boxes_csv outputs\weakloc_fulltest\pseudo_boxes_test.csv `
+  --ckpt E:\project\project2\checkpoints\sam_med2d\sam-med2d_b.pth `
+  --use_letterbox --out_w 1024 --out_h 512 `
+  --use_crop --crop_size 320 `
+  --topk 1 --max_imgs 999999 `
+  --tighten --margin 8 `
+  --save_vis_canvas
+```
+
+---
+
+## 6. QC（质量控制）与“阈值”的作用
+
+### 6.1 运行 QC
+
+```powershell
+conda activate boneai
+cd E:\project\project2
+
+python -m src.seg.qc_filter_masks --out_root outputs/seg_compare/sam2_full --require_npz
+python -m src.seg.qc_filter_masks --out_root outputs/seg_compare/medsam2_full --require_npz
+python -m src.seg.qc_filter_masks --out_root outputs/seg_compare/medsam_full --require_npz
+python -m src.seg.qc_filter_masks --out_root outputs/seg_compare/sam_med2d_full --require_npz
+```
+
+
+
+## 7. 汇总对比（full）
+
+> 说明：当前 `compare_models.py` 的 CLI 以 `--root` 为主（一次跑一个或脚本内部扫描）。如果你需要 `--roots/--outdir` 这种一次性入口，可以后续补一个 wrapper/参数解析。
+
+典型输出文件：
+
+* `summary.csv`：每个模型的 keep_rate、area_ratio/expand_mean/union_area 分位数等
+* `merged_stats.csv`：按 image 维度合并四模型统计，便于做进一步分析/画图/抽样
 
 ---
 
-## 6. 关键设计选择（Why 1024×512 letterbox）
+## 8. 本周 full 对比结果（摘要）
 
-全身骨显像图像通常细长，直接 resize 会造成几何变形，进而影响：
+基于 `summary.csv`（275 张有 bbox 的样本）：
 
-* CAM heatmap 的空间解释
-* 伪框/后续分割 prompt 的坐标一致性
+* **MedSAM (ViT-B)**：keep_rate = 1.00（QC 全保留），mask 视觉效果整体最好 → ✅后续选用
+* **MedSAM2 (tiny)**：keep_rate = 1.00（QC 全保留）
+* **SAM-Med2D (ViT-B)**：keep_rate ≈ 0.993（少量极小 mask 被过滤）
+* **SAM2**：keep_rate ≈ 0.709（大量 mask 因 area_ratio 过小被过滤，说明在本任务设置下更容易产出“极小/无效”mask）
 
-因此统一采用 **letterbox 保比例到 1024×512**：
-
-* 不变形（scale+padding）
-* 全流程统一坐标系（训练 / CAM / boxes / 可视化）
-* 同时保存 `scale/pad_left/pad_top`，支持将结果反变换回原图坐标
+> 后续实验将以 MedSAM (ViT-B) 为主线推进。
 
 ---
 
-## 7. 下一步计划（TODO）
-
-* [ ] 使用 MedSAM2（box prompt）将 `pseudo_boxes_test.csv` 转换为 `pseudo masks`
-* [ ] 伪 mask 质量控制：面积阈值、连通域过滤、与 y_prob/heat_score 一致性检查
-* [ ] （可选）用伪 mask 训练专用 2D 分割模型（U-Net/SegFormer 等），形成可部署方案
-* [ ] 输出“一键管线”：train → select_thr → infer → CAM → boxes → masks → export orig
-
----
-
-## 8. 常见问题（FAQ）
-
-### Q1：为什么建议用 `python -m`？
-
-避免 `ModuleNotFoundError: No module named 'src'`，并统一包导入路径。
-
-### Q2：推理/弱定位 OOM 怎么办？
-
-降低 batch size（例如 `--bs 4`），开启 `--amp`，必要时减少 `max_imgs`。
-
-### Q3：伪框太大怎么办？
-
-优先使用 peak-fixed-box（当前 48×48），可进一步：
-
-* 减小 `box_w/box_h`
-* 增大 `max_boxes`
-* 调整 `nms_iou`
-
----
